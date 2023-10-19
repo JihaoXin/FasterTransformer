@@ -29,6 +29,7 @@
 #include <vector>
 #ifdef SPARSITY_ENABLED
 #include <cusparseLt.h>
+#include <stdio.h>
 #endif
 
 namespace fastertransformer {
