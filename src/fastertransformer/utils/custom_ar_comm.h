@@ -34,7 +34,7 @@ public:
     virtual ~AbstractCustomComm()                                                    = default;
     virtual void customAllReduce(size_t elts, cudaStream_t stream)                   = 0;
     virtual void enableP2P(int ngpus)                                                = 0;
-    virtual bool swapInternalBuffer(std::vector<Tensor>* tensor_buffer, size_t elts) = 0;
+    virtual bool swapInternalBuffer(void** tensor_buffer, size_t elts) = 0;
     virtual void
     allocateAndExchangePeerAccessPointer(std::vector<std::shared_ptr<AbstractCustomComm>>* custom_all_reduce_comms) = 0;
 };
@@ -50,11 +50,11 @@ public:
     void allocateAndExchangePeerAccessPointer(
         std::vector<std::shared_ptr<AbstractCustomComm>>* custom_all_reduce_comms) override;
 
-    bool swapInternalBuffer(std::vector<Tensor>* tensor_buffer, size_t elts) override;
+    bool swapInternalBuffer(void** original_data, size_t elts) override;
 
     void enableP2P(int ngpus) override;
 
-private:
+// private:
     AllReduceParams<T>   param_;
     std::vector<Tensor>* output_tensor_;
     T*                   tmp_tensor_data_;

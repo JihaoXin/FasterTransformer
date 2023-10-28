@@ -47,11 +47,7 @@ void CustomAllReduceComm<T>::customAllReduce(size_t elts, cudaStream_t stream)
 {
     param_.elts_total   = elts;
     param_.barrier_flag = FLAG(param_.barrier_flag + 1);
-
     invokeOneOrTwoShotAllReduceKernel<T>(param_, stream);
-
-    // swap back
-    output_tensor_->at(0).data = (const void*)tmp_tensor_data_;
 }
 
 template<typename T>
@@ -106,16 +102,14 @@ void CustomAllReduceComm<T>::enableP2P(int ngpus)
 }
 
 template<typename T>
-bool CustomAllReduceComm<T>::swapInternalBuffer(std::vector<Tensor>* tensor_buffer, size_t elts)
+bool CustomAllReduceComm<T>::swapInternalBuffer(void** dev_Y, size_t elts)
 {
     // Check if all reduce elts meet the requirement of custom kernels
     // If meet, then swap the local comm buffer ptr with output tensor data pointer (avoid additional
     // memory movement)
     if (rank_size_ > 1 && elts * sizeof(T) <= CUSTOM_AR_SIZE_THRESHOLD) {
-        tmp_tensor_data_               = (T*)(tensor_buffer->at(0).data);
-        output_tensor_                 = tensor_buffer;
-        tensor_buffer->at(0).data      = param_.peer_comm_buffer_ptrs[rank_];
-        param_.local_output_buffer_ptr = tmp_tensor_data_;
+        param_.local_output_buffer_ptr = *(T**)dev_Y;
+        *dev_Y      = param_.peer_comm_buffer_ptrs[rank_];
         return true;
     }
     return false;
