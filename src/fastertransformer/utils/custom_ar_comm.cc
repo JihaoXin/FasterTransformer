@@ -43,6 +43,20 @@ CustomAllReduceComm<T>::~CustomAllReduceComm()
 }
 
 template<typename T>
+void CustomAllReduceComm<T>::customTileAllReduce(size_t tile_row_start, size_t tile_row_end, size_t tile_col_start, size_t tile_col_end, size_t matrix_width, cudaStream_t stream)
+{
+    param_.tile_row_start = tile_row_start;
+    param_.tile_row_end   = tile_row_end;
+    param_.tile_col_start = tile_col_start;
+    param_.tile_col_end   = tile_col_end;
+    param_.matrix_width   = matrix_width;
+    param_.elts_total   = (tile_row_end - tile_row_start) * (tile_col_end - tile_col_start);
+    param_.barrier_flag = FLAG(param_.barrier_flag + 1);
+    invokeOneOrTwoShotAllReduceKernel<T>(param_, stream, true);
+}
+
+
+template<typename T>
 void CustomAllReduceComm<T>::customAllReduce(size_t elts, cudaStream_t stream)
 {
     param_.elts_total   = elts;

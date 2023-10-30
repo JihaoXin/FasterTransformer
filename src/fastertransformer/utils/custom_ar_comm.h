@@ -33,10 +33,10 @@ public:
     AbstractCustomComm()                                                             = default;
     virtual ~AbstractCustomComm()                                                    = default;
     virtual void customAllReduce(size_t elts, cudaStream_t stream)                   = 0;
+    virtual void customTileAllReduce(size_t tile_row_start, size_t tile_row_end, size_t tile_col_start, size_t tile_col_end, size_t matrix_width, cudaStream_t stream) = 0;
     virtual void enableP2P(int ngpus)                                                = 0;
     virtual bool swapInternalBuffer(void** tensor_buffer, size_t elts) = 0;
-    virtual void
-    allocateAndExchangePeerAccessPointer(std::vector<std::shared_ptr<AbstractCustomComm>>* custom_all_reduce_comms) = 0;
+    virtual void allocateAndExchangePeerAccessPointer(std::vector<std::shared_ptr<AbstractCustomComm>>* custom_all_reduce_comms) = 0;
 };
 
 template<typename T>
@@ -46,6 +46,8 @@ public:
     ~CustomAllReduceComm();
 
     void customAllReduce(size_t elts, cudaStream_t stream);
+
+    void customTileAllReduce(size_t tile_row_start, size_t tile_row_end, size_t tile_col_start, size_t tile_col_end, size_t matrix_width, cudaStream_t stream);
 
     void allocateAndExchangePeerAccessPointer(
         std::vector<std::shared_ptr<AbstractCustomComm>>* custom_all_reduce_comms) override;
