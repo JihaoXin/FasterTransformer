@@ -307,7 +307,6 @@ __device__ inline size_t map_to_tile(size_t iter_offset, const AllReduceParams<T
 
     size_t global_x = params.tile_row_start + tile_x;
     size_t global_y = params.tile_col_start + tile_y;
-
     return global_x * params.matrix_width + global_y;
 }
 
@@ -376,6 +375,105 @@ static __global__ void oneShotTileAllReduceKernel(AllReduceParams<T> params)
     }
 }
 
+template<typename T>
+static __global__ void twoShotTileAllReduceKernel(AllReduceParams<T> params)
+{
+
+    // The block index.
+    const int bidx = blockIdx.x;
+    // The thread index with the block.
+    const int tidx = threadIdx.x;
+
+    // The number of elements packed into one for comms
+    static constexpr int NUM_ELTS = std::is_same<T, uint32_t>::value ? 4 : 8;
+
+    // Packed data type for comms
+    using PackedType = typename ARTypeConverter<T>::Type;
+
+    // The location in the destination array (load 8 fp16 or load 4 fp32 using LDG.128).
+    size_t offset = bidx * params.elts_per_block + tidx * NUM_ELTS + params.rank_offset;
+    // The end of the segment computed by that block.
+    size_t max_offset = min(offset + params.elts_per_block, params.elts_total);
+
+    // Synchronize the ranks.
+    volatile uint32_t* barrier_d = params.peer_barrier_ptrs[params.local_rank];
+    if (tidx < RANKS_PER_NODE) {
+        // The 1st block notifies the other ranks.
+        if (bidx == 0) {
+            params.peer_barrier_ptrs[tidx][params.local_rank] = params.barrier_flag;
+        }
+
+        // Busy-wait until all ranks are ready.
+        while (barrier_d[tidx] < params.barrier_flag) {}
+    }
+
+    // Make sure we can move on...
+    __syncthreads();
+
+    // The source pointers. Distributed round-robin for the different warps.
+    T* src_d[RANKS_PER_NODE];
+    // The destination ranks for round-robin gathering
+    size_t dst_rank[RANKS_PER_NODE];
+#pragma unroll
+    for (int ii = 0; ii < RANKS_PER_NODE; ++ii) {
+        int rank     = (params.local_rank + ii) % RANKS_PER_NODE;
+        src_d[ii]    = params.peer_comm_buffer_ptrs[rank];
+        dst_rank[ii] = rank;
+    }
+
+    // Each block accumulates the values from the different GPUs on the same node.
+    for (size_t local_offset = offset; local_offset < max_offset; local_offset += blockDim.x * NUM_ELTS) {
+        size_t mapped_offset = map_to_tile(local_offset, params);
+        // Iterate over the different ranks/devices on the node to load the values.
+        PackedType vals[RANKS_PER_NODE];
+#pragma unroll
+        for (int ii = 0; ii < RANKS_PER_NODE; ++ii) {
+            vals[ii] = reinterpret_cast<const PackedType*>(&src_d[ii][mapped_offset])[0];
+        }
+
+        // Sum the values from the different ranks.
+        PackedType sums = init_packed_type<PackedType>();
+#pragma unroll
+        for (int ii = 0; ii < RANKS_PER_NODE; ++ii) {
+            sums = add128b<PackedType, T>(sums, vals[ii]);
+        }
+
+        // Store to the local buffer.
+        reinterpret_cast<PackedType*>(&src_d[0][mapped_offset])[0] = sums;
+    }
+
+    // sync threads to make sure all block threads have the sums
+    __syncthreads();
+
+    // barreris among the blocks with the same idx (release-acuqire semantics)
+    if (tidx < RANKS_PER_NODE) {
+        // The all blocks notifies the other ranks.
+        uint32_t flag_block_offset = RANKS_PER_NODE + bidx * RANKS_PER_NODE;
+        st_flag_release(params.barrier_flag, params.peer_barrier_ptrs[tidx] + flag_block_offset + params.local_rank);
+
+        // Busy-wait until all ranks are ready.
+        uint32_t  rank_barrier   = 0;
+        uint32_t* peer_barrier_d = params.peer_barrier_ptrs[params.local_rank] + flag_block_offset + tidx;
+        do {
+            ld_flag_acquire(rank_barrier, peer_barrier_d);
+        } while (rank_barrier != params.barrier_flag);
+    }
+
+//     // sync threads to make sure all other ranks has the final partial results
+    __syncthreads();
+
+    // Gather all needed elts from other intra-node ranks
+    for (size_t local_offset = offset; local_offset < max_offset; local_offset += blockDim.x * NUM_ELTS) {
+#pragma unroll
+        for (int ii = 0; ii < RANKS_PER_NODE; ++ii) {
+            // use round-robin gathering from other ranks
+            int offset_rank = local_offset + (dst_rank[ii] - params.local_rank) * params.elts_per_rank;
+            size_t mapped_offset = map_to_tile(offset_rank, params);
+            reinterpret_cast<PackedType*>(&params.local_output_buffer_ptr[mapped_offset])[0] = 
+                reinterpret_cast<PackedType*>(&src_d[ii][mapped_offset])[0];
+        }
+    }
+}
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -475,14 +573,11 @@ void invokeOneOrTwoShotAllReduceKernel(AllReduceParams<T>& param, cudaStream_t s
             param.elts_per_block = param.elts_per_rank / blocks_per_grid;
             oneShotTileAllReduceKernel<<<blocks_per_grid, threads_per_block, 0, stream>>>(param);
         }else{
-            // exit with error
-            assert(false);
-            // param.elts_per_rank  = param.elts_total / RANKS_PER_NODE;
-            // param.elts_per_block = param.elts_per_rank / blocks_per_grid;
-            // param.rank_offset    = param.rank * param.elts_per_rank;
-            // twoShotAllReduceKernel<<<blocks_per_grid, threads_per_block, 0, stream>>>(param);
+            param.elts_per_rank  = param.elts_total / RANKS_PER_NODE;
+            param.elts_per_block = param.elts_per_rank / blocks_per_grid;
+            param.rank_offset    = param.rank * param.elts_per_rank;
+            twoShotTileAllReduceKernel<<<blocks_per_grid, threads_per_block, 0, stream>>>(param);
         }
-
     }
 }
 
