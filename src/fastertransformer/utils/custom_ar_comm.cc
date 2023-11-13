@@ -43,16 +43,21 @@ CustomAllReduceComm<T>::~CustomAllReduceComm()
 }
 
 template<typename T>
-void CustomAllReduceComm<T>::customTileAllReduce(size_t tile_row_start, size_t tile_row_end, size_t tile_col_start, size_t tile_col_end, size_t matrix_width, cudaStream_t stream)
+void CustomAllReduceComm<T>::customTileAllReduce(size_t tile_height, size_t tile_width, size_t matrix_height, size_t matrix_width, cudaStream_t stream)
 {
-    param_.tile_row_start = tile_row_start;
-    param_.tile_row_end   = tile_row_end;
-    param_.tile_col_start = tile_col_start;
-    param_.tile_col_end   = tile_col_end;
-    param_.matrix_width   = matrix_width;
-    param_.elts_total   = (tile_row_end - tile_row_start) * (tile_col_end - tile_col_start);
+    param_.tile_height   = tile_height;
+    param_.tile_width    = tile_width;
+    param_.matrix_height = matrix_height;
+    param_.matrix_width  = matrix_width;
+    param_.elts_per_block = tile_height * tile_width;
+    param_.elts_total   =  matrix_height * matrix_width;
     param_.barrier_flag = FLAG(param_.barrier_flag + 1);
-    invokeOneOrTwoShotAllReduceKernel<T>(param_, stream, true);
+    // Print param
+    if(rank_ == 0){
+    printf("tile_height: %ld, tile_width: %ld, matrix_height: %ld, matrix_width: %ld, elts_per_block: %ld, elts_total: %ld\n",
+           param_.tile_height, param_.tile_width, param_.matrix_height, param_.matrix_width, param_.elts_per_block, param_.elts_total);
+    }
+    invokeOneOrTwoShotTileAllReduceKernel<T>(param_, stream);
 }
 
 
@@ -176,7 +181,7 @@ void initCustomAllReduceComm(std::vector<std::shared_ptr<AbstractCustomComm>>* c
 // Template instantiation
 template class CustomAllReduceComm<uint16_t>;
 #ifdef ENABLE_BF16
-template class CustomAllReduceComm<__nv_bfloat16>;
+// template class CustomAllReduceComm<__nv_bfloat16>;
 #endif
 template class CustomAllReduceComm<uint32_t>;
 template void
@@ -184,10 +189,10 @@ initCustomAllReduceComm<uint16_t>(std::vector<std::shared_ptr<AbstractCustomComm
                                   int                                               enable_custom_all_reduce,
                                   size_t                                            rank_size);
 #ifdef ENABLE_BF16
-template void
-initCustomAllReduceComm<__nv_bfloat16>(std::vector<std::shared_ptr<AbstractCustomComm>>* custom_all_reduce_comms,
-                                       int                                               enable_custom_all_reduce,
-                                       size_t                                            rank_size);
+// template void
+// initCustomAllReduceComm<__nv_bfloat16>(std::vector<std::shared_ptr<AbstractCustomComm>>* custom_all_reduce_comms,
+//                                        int                                               enable_custom_all_reduce,
+//                                        size_t                                            rank_size);
 #endif
 template void
 initCustomAllReduceComm<uint32_t>(std::vector<std::shared_ptr<AbstractCustomComm>>* custom_all_reduce_comms,

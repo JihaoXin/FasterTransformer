@@ -49,11 +49,14 @@ struct AllReduceParams {
     size_t    elts_per_block;
     size_t    rank_offset;
     size_t    rank, local_rank, node_id;
+    size_t    tile_height;
+    size_t    tile_width;
     size_t    tile_row_start;
     size_t    tile_row_end;
     size_t    tile_col_start;
     size_t    tile_col_end;
-    size_t    matrix_width; // Adding the actual width of the matrix
+    size_t    matrix_height;
+    size_t    matrix_width;
     uint32_t  barrier_flag;
     uint32_t* peer_barrier_ptrs[RANKS_PER_NODE];
     T*        peer_comm_buffer_ptrs[RANKS_PER_NODE];
@@ -61,7 +64,10 @@ struct AllReduceParams {
 };
 
 template<typename T>
-void invokeOneOrTwoShotAllReduceKernel(AllReduceParams<T>& param, cudaStream_t stream, bool is_tile = false);
+void invokeOneOrTwoShotAllReduceKernel(AllReduceParams<T>& param, cudaStream_t stream);
+
+template<typename T>
+void invokeOneOrTwoShotTileAllReduceKernel(AllReduceParams<T>& param, cudaStream_t stream);
 
 void kernelLaunchConfig(int& blocks_per_grid, int& threads_per_block, size_t elts, int kernel_algo);
 
