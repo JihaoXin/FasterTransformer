@@ -53,10 +53,10 @@ void CustomAllReduceComm<T>::customTileAllReduce(size_t tile_height, size_t tile
     param_.elts_total   =  matrix_height * matrix_width;
     param_.barrier_flag = FLAG(param_.barrier_flag + 1);
     // Print param
-    if(rank_ == 0){
-    printf("tile_height: %ld, tile_width: %ld, matrix_height: %ld, matrix_width: %ld, elts_per_block: %ld, elts_total: %ld\n",
-           param_.tile_height, param_.tile_width, param_.matrix_height, param_.matrix_width, param_.elts_per_block, param_.elts_total);
-    }
+    // if(rank_ == 0){
+    // printf("tile_height: %ld, tile_width: %ld, matrix_height: %ld, matrix_width: %ld, elts_per_block: %ld, elts_total: %ld\n",
+    //        param_.tile_height, param_.tile_width, param_.matrix_height, param_.matrix_width, param_.elts_per_block, param_.elts_total);
+    // }
     invokeOneOrTwoShotTileAllReduceKernel<T>(param_, stream);
 }
 

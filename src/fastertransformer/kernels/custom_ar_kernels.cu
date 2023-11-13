@@ -397,6 +397,7 @@ template void invokeOneOrTwoShotAllReduceKernel<uint32_t>(AllReduceParams<uint32
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //////////////////////////////////Tile AllReduce////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+/// Map from tile's internal index to index of this rank.
 template <typename T>
 __device__ inline size_t map_to_tile(size_t offset, const AllReduceParams<T>& params) {
     size_t tile_x = offset / params.tile_width;
@@ -460,10 +461,10 @@ static __global__ void oneShotTileAllReduceKernel(AllReduceParams<T> params)
     for (size_t local_offset = offset; local_offset < max_offset; local_offset += blockDim.x * NUM_ELTS) {
         if(local_offset >= params.tile_height * params.tile_width) break;
         // Iterate over the different ranks/devices on the node to load the values.
-        size_t mappe_offset = map_to_tile(local_offset, params);
+        size_t mapped_offset = map_to_tile(local_offset, params);
     #pragma unroll
         for (int ii = 0; ii < RANKS_PER_NODE; ++ii) {
-            vals[ii] = reinterpret_cast<const PackedType*>(&src_d[ii][mappe_offset])[0];
+            vals[ii] = reinterpret_cast<const PackedType*>(&src_d[ii][mapped_offset])[0];
         }
 
         // Sum the values from the different ranks.
@@ -474,12 +475,114 @@ static __global__ void oneShotTileAllReduceKernel(AllReduceParams<T> params)
         }
 
         // Store to the destination buffer.
-        float bidx_float = static_cast<float>(bidx);
-        sums.x = reinterpret_cast<uint32_t*>(&bidx_float)[0];
-        sums.y = reinterpret_cast<uint32_t*>(&bidx_float)[0];
-        sums.z = reinterpret_cast<uint32_t*>(&bidx_float)[0];
-        sums.w = reinterpret_cast<uint32_t*>(&bidx_float)[0];
-        reinterpret_cast<PackedType*>(&params.local_output_buffer_ptr[mappe_offset])[0] = sums;
+        reinterpret_cast<PackedType*>(&params.local_output_buffer_ptr[mapped_offset])[0] = sums;
+    }
+}
+template<typename T>
+static __global__ void twoShotTileAllReduceKernel(AllReduceParams<T> params)
+{
+
+    // Calculate Tile Position.
+    const int block_dim_x = blockIdx.x;
+    const int block_dim_y = blockIdx.y;
+    params.tile_row_start = block_dim_x * params.tile_height;
+    params.tile_row_end = min(params.tile_row_start + params.tile_height, params.matrix_height);
+    params.tile_col_start = block_dim_y * params.tile_width;
+    params.tile_col_end = min(params.tile_col_start + params.tile_width, params.matrix_width);
+    // The block index and thread index with the block.
+    const int bidx = block_dim_x * gridDim.y + block_dim_y;
+    const int tidx = threadIdx.x;
+
+    // The number of elements packed into one for comms
+    static constexpr int NUM_ELTS = std::is_same<T, uint32_t>::value ? 4 : 8;
+
+    // Packed data type for comms
+    using PackedType = typename ARTypeConverter<T>::Type;
+
+    // The starting offset inside a tile(block).
+    size_t offset = tidx * NUM_ELTS;
+    // The end of the segment computed by that block.
+    size_t max_offset = params.tile_height * params.tile_width;
+
+    // Synchronize the ranks.
+    volatile uint32_t* barrier_d = params.peer_barrier_ptrs[params.local_rank];
+    if (tidx < RANKS_PER_NODE) {
+        // The 1st block notifies the other ranks.
+        if (bidx == 0) {
+            params.peer_barrier_ptrs[tidx][params.local_rank] = params.barrier_flag;
+        }
+
+        // Busy-wait until all ranks are ready.
+        while (barrier_d[tidx] < params.barrier_flag) {}
+    }
+
+    // Make sure we can move on...
+    __syncthreads();
+
+    // The source pointers. Distributed round-robin for the different warps.
+    T* src_d[RANKS_PER_NODE];
+    // The destination ranks for round-robin gathering
+    size_t dst_rank[RANKS_PER_NODE];
+#pragma unroll
+    for (int ii = 0; ii < RANKS_PER_NODE; ++ii) {
+        int rank     = (params.local_rank + ii) % RANKS_PER_NODE;
+        src_d[ii]    = params.peer_comm_buffer_ptrs[rank];
+        dst_rank[ii] = rank;
+    }
+
+    // Each block accumulates the values from the different GPUs on the same node.
+    PackedType vals[RANKS_PER_NODE];
+    for (size_t local_offset = offset; local_offset < max_offset; local_offset += blockDim.x * NUM_ELTS) {
+        // Iterate over the different ranks/devices on the node to load the values.
+        size_t mapped_offset = map_to_tile(local_offset, params) + params.rank_offset;
+        if(mapped_offset >= params.elts_total) break;
+#pragma unroll
+        for (int ii = 0; ii < RANKS_PER_NODE; ++ii) {
+            vals[ii] = reinterpret_cast<const PackedType*>(&src_d[ii][mapped_offset])[0];
+        }
+
+        // Sum the values from the different ranks.
+        PackedType sums = init_packed_type<PackedType>();
+#pragma unroll
+        for (int ii = 0; ii < RANKS_PER_NODE; ++ii) {
+            sums = add128b<PackedType, T>(sums, vals[ii]);
+        }
+
+        // Store to the local buffer.
+        reinterpret_cast<PackedType*>(&src_d[0][mapped_offset])[0] = sums;
+    }
+
+    // sync threads to make sure all block threads have the sums
+    __syncthreads();
+
+    // barreris among the blocks with the same idx (release-acuqire semantics)
+    if (tidx < RANKS_PER_NODE) {
+        // The all blocks notifies the other ranks.
+        uint32_t flag_block_offset = RANKS_PER_NODE + bidx * RANKS_PER_NODE;
+        st_flag_release(params.barrier_flag, params.peer_barrier_ptrs[tidx] + flag_block_offset + params.local_rank);
+
+        // Busy-wait until all ranks are ready.
+        uint32_t  rank_barrier   = 0;
+        uint32_t* peer_barrier_d = params.peer_barrier_ptrs[params.local_rank] + flag_block_offset + tidx;
+        do {
+            ld_flag_acquire(rank_barrier, peer_barrier_d);
+        } while (rank_barrier != params.barrier_flag);
+    }
+
+    // sync threads to make sure all other ranks has the final partial results
+    __syncthreads();
+
+    // Gather all needed elts from other intra-node ranks
+    for (size_t local_offset = offset; local_offset < max_offset; local_offset += blockDim.x * NUM_ELTS) {
+#pragma unroll
+        for (int ii = 0; ii < RANKS_PER_NODE; ++ii) {
+            // use round-robin gathering from other ranks
+            size_t rank_internal_offset = map_to_tile(local_offset, params); 
+            int real_offset = rank_internal_offset + params.rank_offset + (dst_rank[ii] - params.local_rank) * params.elts_per_rank;
+            if(real_offset >= params.elts_total) break;
+            reinterpret_cast<PackedType*>(&params.local_output_buffer_ptr[real_offset])[0] =
+                reinterpret_cast<PackedType*>(&src_d[ii][real_offset])[0];
+        }
     }
 }
 
@@ -487,28 +590,22 @@ static __global__ void oneShotTileAllReduceKernel(AllReduceParams<T> params)
 template<typename T>
 void invokeOneOrTwoShotTileAllReduceKernel(AllReduceParams<T>& param, cudaStream_t stream)
 {
-    param_.tile_height   = tile_height;
-    param_.tile_width    = tile_width;
-    param_.matrix_height = matrix_height;
-    param_.matrix_width  = matrix_width;
-    param_.elts_per_block = tile_height * tile_width;
-    param_.elts_total   =  matrix_height * matrix_width;
-    param_.barrier_flag = FLAG(param_.barrier_flag + 1);
+
     static constexpr int NUM_ELTS = std::is_same<T, uint32_t>::value ? 4 : 8;
-    // if (param.elts_total * sizeof(T) <= DEFALUT_ALGO_AR_SIZE_THRESHOLD){
-    if(false){
+    if (param.elts_total * sizeof(T) <= DEFALUT_ALGO_AR_SIZE_THRESHOLD){
         // Config grid/block dim
         dim3 dimBlock((param.matrix_height+param.tile_height-1) / param.tile_height, (param.matrix_width+param.tile_width-1) / param.tile_width);
         int threads_per_block = min(int(param.tile_height * param.tile_width / NUM_ELTS), DEFAULT_BLOCK_SIZE); // Max 1024 threads per block
-        if(param.rank == 0) {printf("dimBlock.x = %d, dimBlock.y = %d, threads_per_block = %d \n", dimBlock.x, dimBlock.y, threads_per_block);}
+        // if(param.rank == 0) {printf("dimBlock.x = %d, dimBlock.y = %d, threads_per_block = %d \n", dimBlock.x, dimBlock.y, threads_per_block);}
         oneShotTileAllReduceKernel<<<dimBlock, threads_per_block, 0, stream>>>(param);
     }else{
-        param.matrix_height = (param.matrix_height + RANKS_PER_NODE - 1) / RANKS_PER_NODE * RANKS_PER_NODE;
+        param.matrix_height = (param.matrix_height + RANKS_PER_NODE - 1) / RANKS_PER_NODE;
         dim3 dimBlock((param.matrix_height+param.tile_height-1) / param.tile_height, (param.matrix_width+param.tile_width-1) / param.tile_width);
-        param.elts_per_rank  = matrix_height * matrix_width;;
+        int threads_per_block = min(int(param.tile_height * param.tile_width / NUM_ELTS), DEFAULT_BLOCK_SIZE); // Max 1024 threads per block
+        param.elts_per_rank  = param.matrix_height * param.matrix_width;;
         param.rank_offset    = param.rank * param.elts_per_rank;
-        
-        twoShotTileAllReduceKernel<<<blocks_per_grid, threads_per_block, 0, stream>>>(param);
+        // if(param.rank == 0) {printf("dimBlock.x = %d, dimBlock.y = %d, threads_per_block = %d\n", dimBlock.x, dimBlock.y, threads_per_block);}
+        twoShotTileAllReduceKernel<<<dimBlock, threads_per_block, 0, stream>>>(param);
     }
 }
 
