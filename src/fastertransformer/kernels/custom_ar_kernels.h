@@ -51,10 +51,6 @@ struct AllReduceParams {
     size_t    rank, local_rank, node_id;
     size_t    tile_height;
     size_t    tile_width;
-    size_t    tile_row_start;
-    size_t    tile_row_end;
-    size_t    tile_col_start;
-    size_t    tile_col_end;
     size_t    matrix_height;
     size_t    matrix_width;
     uint32_t  barrier_flag;
